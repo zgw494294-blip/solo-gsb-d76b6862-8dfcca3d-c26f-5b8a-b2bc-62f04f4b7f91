@@ -4,6 +4,15 @@
 # 尚未返回”的窗口内完整落库。修复前两份响应都显示 declared_length=6，
 # 修复后必须分别为 3、6，且最终数据库状态为 6（等价某种串行执行）。
 #
+# 复现顺序（与 test_api.py 第 12 节一致）：
+#   1) 发起声明 A，等待挂点确认（declare_update.held 出现）——这才说明
+#      A 已提交且停在返回前。不能用数据库可见代替：A commit 后若被调度
+#      出去、尚未进入挂点，库中已可见 3，此时放 B 进来会抢先接管标记并
+#      被挂起，而脚本又在等 B 返回，形成等待环；
+#   2) 发竞争声明 B，等它完整返回；
+#   3) 确认 A 的响应仍未返回，再删除 .held 放行 A。
+# 任何一步等待超时或失败都会退出并经 trap 释放挂点，脚本不会挂死。
+#
 # 依赖服务以 FIRMWARE_TEST_PAUSE_DIR=<目录> 启动（见 README“并发交错复现”）。
 # 纯 curl，无第三方工具（jq 仅用于美化，缺失也能跑）。
 set -u
@@ -13,7 +22,26 @@ PAUSE_DIR=${FIRMWARE_TEST_PAUSE_DIR:-/tmp/fw-pause}
 # 每次运行使用唯一设备，避免与历史数据相互干扰（API 不提供删除）
 DEV=${DEV:-race-http-$(date +%s)-$$}
 OUT=${OUT_DIR:-/tmp/fw-race-out}
+# 单次 HTTP 请求的最长耗时（秒）；挂点确认/请求返回的轮询上限（×0.05s）
+CURL_MAX=${CURL_MAX:-30}
+WAIT_MAX=${WAIT_MAX:-200}
 mkdir -p "$OUT"
+
+MARKER="$PAUSE_DIR/declare_update"
+HELD="$PAUSE_DIR/declare_update.held"
+PID_A=""
+
+# 无论成功、失败还是超时，退出前都释放挂点并等后台请求收尾：
+# 删除 marker 与 .held（被挂请求随即放行），不留下挂点影响后续请求。
+cleanup() {
+  rm -f "$HELD" "$MARKER"
+  # A 若仍被挂起，.held 已删，它会自行返回；curl 有 --max-time 兜底
+  [ -n "$PID_A" ] && wait "$PID_A" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+
+fail() { echo "FAIL: $*"; exit 1; }
 
 jqf() { if command -v jq >/dev/null 2>&1; then jq "$@"; else cat; fi; }
 sha256_hex() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
@@ -22,14 +50,14 @@ sha256_hex() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 first_declared() { grep -o '"declared_length":[0-9][0-9]*' | head -1 | cut -d: -f2; }
 req() { # method path [json-body]
   if [ -n "${3:-}" ]; then
-    curl -sS -X "$1" "$BASE$2" -H 'Content-Type: application/json' -d "$3"
+    curl -sS --max-time "$CURL_MAX" -X "$1" "$BASE$2" -H 'Content-Type: application/json' -d "$3"
   else
-    curl -sS -X "$1" "$BASE$2"
+    curl -sS --max-time "$CURL_MAX" -X "$1" "$BASE$2"
   fi
 }
 
 echo ">> 健康检查"
-curl -fsS "$BASE/health" >/dev/null || { echo "服务未就绪：$BASE/health"; exit 1; }
+curl -fsS --max-time 5 "$BASE/health" >/dev/null || { echo "服务未就绪：$BASE/health"; exit 1; }
 
 echo ">> 设备：$DEV"
 echo ">> 创建设备（初始镜像 base）"
@@ -40,32 +68,47 @@ req POST /devices "$(printf '{"device_id":"%s","initial_image_base64":"%s"}' "$D
 SHA3=$(sha256_hex abc)
 SHA6=$(sha256_hex abcdef)
 
-echo ">> 放置挂点标记：$PAUSE_DIR/declare_update"
+echo ">> 清理并放置挂点标记：$MARKER"
 mkdir -p "$PAUSE_DIR"
-: > "$PAUSE_DIR/declare_update"
+rm -f "$MARKER" "$HELD"      # 清掉上次异常运行可能残留的标记，避免误判挂点确认
+: > "$MARKER"
+: > "$OUT/respA.json"        # 清空历史输出，下面的“未返回”判断以本文件为准
+: > "$OUT/respB.json"
 
 echo ">> 发起声明 A（length=3），它会在提交后阻塞在挂点上"
 ( req PUT "/devices/$DEV/update" "$(printf '{"length":3,"sha256":"%s"}' "$SHA3")" \
     > "$OUT/respA.json" ) &
 PID_A=$!
 
-echo ">> 等待 A 的写入落库（轮询 GET 看到 declared_length=3）"
-for _ in $(seq 1 200); do
-  L=$(req GET "/devices/$DEV" | first_declared)
-  [ "$L" = "3" ] && break
+echo ">> 等待挂点确认：$HELD 出现（= A 已提交且停在返回前）"
+for _ in $(seq 1 "$WAIT_MAX"); do
+  [ -e "$HELD" ] && break
+  # A 若未命中挂点就已返回（服务未开启挂点？），不必空等
+  [ -s "$OUT/respA.json" ] && break
   sleep 0.05
 done
-[ "$L" = "3" ] || { echo "未等到 A 落库"; rm -f "$PAUSE_DIR/declare_update" "$PAUSE_DIR/declare_update.held"; exit 1; }
-echo "   A 已提交（库中=3），但响应尚未返回"
+[ -e "$HELD" ] || fail "未等到挂点确认（A 未停在提交后挂点）。服务需以 FIRMWARE_TEST_PAUSE_DIR=$PAUSE_DIR 启动"
+[ -s "$OUT/respA.json" ] && fail "A 在挂点确认前已返回，交错不成立"
+echo "   确认：A 已提交且停在返回前（挂点已接管标记）"
 
-echo ">> 在 A 返回前，完整执行声明 B（length=6）"
-req PUT "/devices/$DEV/update" "$(printf '{"length":6,"sha256":"%s"}' "$SHA6")" > "$OUT/respB.json"
+echo ">> 发起竞争声明 B（length=6），等它完整返回"
+req PUT "/devices/$DEV/update" "$(printf '{"length":6,"sha256":"%s"}' "$SHA6")" > "$OUT/respB.json" \
+  || fail "B 请求失败（curl 异常或超时）"
 LB=$(first_declared < "$OUT/respB.json")
-[ "$LB" = "6" ] || { echo "B 自身响应应为 6，实际：$LB"; rm -f "$PAUSE_DIR/declare_update" "$PAUSE_DIR/declare_update.held"; exit 1; }
+[ "$LB" = "6" ] || fail "B 自身响应应为 6，实际：$LB"
 
-echo ">> 删除标记，放行 A 返回"
-rm -f "$PAUSE_DIR/declare_update" "$PAUSE_DIR/declare_update.held"
-wait "$PID_A"
+echo ">> B 已完成；确认 A 的响应仍未返回"
+[ -s "$OUT/respA.json" ] && fail "A 在放行前已返回，交错不成立"
+
+echo ">> 删除 $HELD，放行 A"
+rm -f "$HELD"
+for _ in $(seq 1 "$WAIT_MAX"); do
+  [ -s "$OUT/respA.json" ] && break
+  sleep 0.05
+done
+[ -s "$OUT/respA.json" ] || fail "放行后 A 仍未返回"
+wait "$PID_A" 2>/dev/null
+PID_A=""
 
 LA=$(first_declared < "$OUT/respA.json")
 FINAL=$(req GET "/devices/$DEV" | first_declared)

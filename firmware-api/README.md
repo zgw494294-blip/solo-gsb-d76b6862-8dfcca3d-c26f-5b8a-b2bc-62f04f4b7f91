@@ -11,6 +11,13 @@
 docker compose up --build -d
 ```
 
+确认已就绪：
+
+```bash
+docker compose ps
+curl -s http://localhost:8000/health      # {"status":"ok"}
+```
+
 - 端口：**`8000`**（HTTP）
 - API 文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET http://localhost:8000/health`
@@ -19,10 +26,12 @@ docker compose up --build -d
   **服务（进程）重启后分块上传进度、试启令牌等状态全部保留**；
   只有对设备调用 `POST /restart` 才算“设备重启”。
 
-停止 / 重置数据：
+停止 / 重启 / 重置数据：
 
 ```bash
+docker compose restart         # 重启服务进程（数据保留，可验证重启不丢状态）
 docker compose down            # 停止，保留数据卷
+docker compose up -d           # 再次启动，数据仍在
 docker compose down -v         # 停止并删除数据卷（清空所有设备）
 docker compose logs -f         # 查看日志
 ```
@@ -240,6 +249,15 @@ curl -s -X POST "http://localhost:8000/devices/dev-001/confirm?token=$TOKEN3" | 
 （`declare_update` / `create_device` / `confirm`）；第一个命中的请求会
 原子接管标记（重命名为 `<name>.held`）并阻塞，删除 `.held` 即放行，
 其余请求不受影响。正常启动（不设该变量）时此挂点为空操作。
+为防止复现方异常退出后请求被永久挂起，阻塞设有上限
+（`FIRMWARE_TEST_PAUSE_MAX_SECONDS`，默认 120 秒），超时自动放行。
+
+**复现顺序的关键**：`<name>.held` 出现才是“首请求已提交且停在返回前”的
+确认。不能用数据库可见性代替——首请求 commit 后若被调度出去、尚未进入
+挂点，库中已可见其写入，此时放竞争请求进来会抢先接管标记并被挂起，
+而复现方还在等它返回，形成等待环。`scripts/race_repro.sh` 严格按
+“等 `.held` → 发竞争请求 → 确认首响应未返回 → 删 `.held` 放行”执行，
+任何一步等待超时或失败都会退出并释放挂点，脚本不会挂死。
 
 ### 方式一：Docker Compose（沿用同一持久卷）
 
@@ -298,16 +316,19 @@ curl -s -X PUT http://localhost:8000/devices/dev-race/update \
   -H 'Content-Type: application/json' \
   -d "{\"length\":3,\"sha256\":\"$SHA3\"}" > /tmp/respA.json &
 
-# 2) 轮询确认 A 已落库（应打印 3）
-sleep 0.2
-curl -s http://localhost:8000/devices/dev-race | grep -o '"declared_length":[0-9]*'
+# 2) 等挂点确认：declare_update.held 出现 = A 已提交且停在返回前。
+#    不要用查询数据库代替（A 提交后被调度出去时库中已可见，但挂点未确认，
+#    此时发 B 会被 B 抢占标记，形成等待环）
+while [ ! -e /tmp/fw-pause/declare_update.held ]; do sleep 0.05; done
 
 # 3) A 尚未返回时，完整执行声明 B（length=6）
 curl -s -X PUT http://localhost:8000/devices/dev-race/update \
   -H 'Content-Type: application/json' \
   -d "{\"length\":6,\"sha256\":\"$SHA6\"}" | grep -o '"declared_length":[0-9]*'   # 6
 
-# 4) 放行 A；修复前 /tmp/respA.json 里是 6（混入），修复后必须是 3
+# 4) 确认 A 仍未返回（/tmp/respA.json 为空），再放行 A；
+#    修复前 /tmp/respA.json 里是 6（混入），修复后必须是 3
+[ -s /tmp/respA.json ] || echo "A 仍未返回，可以放行"
 rm -f /tmp/fw-pause/declare_update.held
 wait
 grep -o '"declared_length":[0-9]*' /tmp/respA.json    # 期望 3
@@ -325,6 +346,7 @@ python3 test_api.py
 - **受控交错（第 12 节）**：通过挂点确定性制造“后写在前写返回前落库”的交错，
   分别核对两次 `PUT /update`（长度 3、6）、`POST /devices`（创建响应保持初始
   状态）、`POST /confirm`（确认响应不带入随后声明）的**响应快照**与**最终
-  数据库状态**均等价于串行执行。
+  数据库状态**均等价于串行执行。三组回归都先等挂点确认（首请求已提交且停在
+  返回前）再发竞争请求，并注入“首请求提交后被调度出去”的延迟覆盖该时序。
 - **提交失败不报成功（第 13 节）**：注入连接代理让 `commit` 抛错，断言接口
   返回 5xx、库状态保持操作前、服务仍可继续处理请求。

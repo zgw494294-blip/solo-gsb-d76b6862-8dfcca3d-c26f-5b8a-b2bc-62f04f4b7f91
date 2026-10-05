@@ -65,7 +65,16 @@ def utc_now() -> str:
 # 原子 rename 接管标记（变为 <name>.held）并在“已提交但未返回”的窗口阻塞，
 # 直到 .held 文件被删除；后续请求见不到原标记，直接放行。这样可以在第一个
 # 请求被挂起期间让第二个请求完整落库，确定性地构造交错。
+#
+# 复现方必须等到 <name>.held 出现——这才是“首请求已提交且停在返回前”的
+# 确认——再发竞争请求；不能用数据库可见性代替：首请求 commit 后若被调度
+# 出去、尚未进入本挂点，库中已可见其写入，此时放竞争请求进来会抢先接管
+# 标记并被挂起，而复现方还在等它返回，形成等待环。复现结束（含超时与
+# 失败路径）必须删除标记与 .held 释放挂点。为防止复现方异常退出后请求
+# 被永久挂起，阻塞设有上限（FIRMWARE_TEST_PAUSE_MAX_SECONDS，默认 120 秒），
+# 超时自动放行。
 PAUSE_DIR = os.environ.get("FIRMWARE_TEST_PAUSE_DIR")
+PAUSE_MAX_SECONDS = float(os.environ.get("FIRMWARE_TEST_PAUSE_MAX_SECONDS", "120"))
 
 
 def after_commit_hook(name: str) -> None:
@@ -81,7 +90,8 @@ def after_commit_hook(name: str) -> None:
         return
     except OSError:
         return
-    while os.path.exists(held):
+    deadline = time.monotonic() + PAUSE_MAX_SECONDS
+    while os.path.exists(held) and time.monotonic() < deadline:
         time.sleep(0.01)
 
 

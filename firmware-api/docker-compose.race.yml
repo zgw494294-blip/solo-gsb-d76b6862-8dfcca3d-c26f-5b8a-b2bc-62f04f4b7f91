@@ -2,8 +2,9 @@
 # 用法：
 #   docker compose -f docker-compose.yml -f docker-compose.race.yml up --build
 # 它额外开启提交后挂点（FIRMWARE_TEST_PAUSE_DIR）并把宿主同路径目录挂入容器，
-# 供 scripts/race_repro.sh 通过“标记文件存在则暂停、删除则放行”制造确定性交错。
-# 持久卷 firmware-data 沿用主文件定义，不另起数据目录。
+# 供 scripts/race_repro.sh 制造确定性交错：首个命中标记的请求提交后接管标记
+# （变为 <name>.held）并停在返回前，脚本确认 .held 出现后再发竞争请求，
+# 最后删除 .held 放行。持久卷 firmware-data 沿用主文件定义，不另起数据目录。
 services:
   firmware-api:
     environment:
