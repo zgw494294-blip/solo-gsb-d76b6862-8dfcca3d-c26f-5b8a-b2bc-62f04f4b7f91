@@ -63,9 +63,29 @@ def utc_now() -> str:
 # FIRMWARE_TEST_PAUSE_DIR=<目录> 时启用：若该目录下存在与接口同名的标记文件
 # （declare_update / create_device / confirm），**第一个**命中的请求通过
 # 原子 rename 接管标记（变为 <name>.held）并在“已提交但未返回”的窗口阻塞，
-# 直到 .held 文件被删除；后续请求见不到原标记，直接放行。这样可以在第一个
-# 请求被挂起期间让第二个请求完整落库，确定性地构造交错。
+# 直到 .held 文件被删除；后续请求见不到原标记，直接放行。
+#
+# 与复现脚本配合的协议（顺序不可颠倒）：
+#   1. 脚本放置标记 <name>，再发出首请求；
+#   2. 脚本必须等到 <name>.held **出现** —— 这才是“首请求已提交且停在
+#      返回前”的确认。不能用数据库可见代替：首请求可能在 commit 之后、
+#      执行本钩子之前被调度出去，此时标记尚未被接管，若就此发出竞争请求，
+#      竞争请求会抢占标记并挂起，而脚本又在等它返回，形成等待环；
+#   3. 脚本再发竞争请求并等其完整返回（它见不到标记，直接放行）；
+#   4. 确认首请求仍未返回后，删除 <name>.held 放行。
+# 挂起设有安全上限（默认 30 秒，可用 FIRMWARE_TEST_PAUSE_MAX_SECONDS 调整）：
+# 即使脚本异常退出、忘了删除 .held，服务线程也不会被无限占用。
 PAUSE_DIR = os.environ.get("FIRMWARE_TEST_PAUSE_DIR")
+
+
+def _pause_max_seconds() -> float:
+    try:
+        return float(os.environ.get("FIRMWARE_TEST_PAUSE_MAX_SECONDS", "30"))
+    except ValueError:
+        return 30.0
+
+
+PAUSE_MAX_SECONDS = _pause_max_seconds()
 
 
 def after_commit_hook(name: str) -> None:
@@ -75,13 +95,17 @@ def after_commit_hook(name: str) -> None:
     marker = os.path.join(pause_dir, name)
     held = os.path.join(pause_dir, name + ".held")
     try:
-        # 原子接管：只有一个请求能成功；其余请求直接放行返回
+        # 原子接管：只有一个请求能成功；其余请求直接放行返回。
+        # rename 成功即“已提交且停在返回前”的确认信号（.held 出现）。
         os.rename(marker, held)
-    except FileNotFoundError:
-        return
     except OSError:
+        # 没有标记（含 FileNotFoundError）：直接放行
         return
+    deadline = time.monotonic() + PAUSE_MAX_SECONDS
     while os.path.exists(held):
+        if time.monotonic() >= deadline:
+            # 超时自保：宁可让复现失败，也不无限挂起服务线程
+            return
         time.sleep(0.01)
 
 

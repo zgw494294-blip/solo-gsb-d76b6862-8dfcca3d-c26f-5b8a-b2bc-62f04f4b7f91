@@ -241,6 +241,19 @@ curl -s -X POST "http://localhost:8000/devices/dev-001/confirm?token=$TOKEN3" | 
 原子接管标记（重命名为 `<name>.held`）并阻塞，删除 `.held` 即放行，
 其余请求不受影响。正常启动（不设该变量）时此挂点为空操作。
 
+复现必须按下面的顺序推进，否则会形成等待环（脚本挂死）：
+
+1. 放置标记后发出首请求；
+2. **等到 `<name>.held` 出现**——这才是“首请求已提交且停在返回前”的
+   确认。不能用“数据库里查得到”代替：首请求可能在 commit 之后、进入
+   挂点之前被调度出去，此时标记尚未被接管，若就此发出竞争请求，竞争
+   请求会抢占标记并挂起，而脚本又在等它返回，两头互等；
+3. 再发竞争请求并等它完整返回（它见不到标记，直接放行）；
+4. 确认首请求的响应仍未返回，才删除 `.held` 放行。
+
+挂起有安全上限（默认 30 秒，可用 `FIRMWARE_TEST_PAUSE_MAX_SECONDS`
+调整）：即使脚本异常退出、忘了删除 `.held`，服务线程也不会被无限占用。
+
 ### 方式一：Docker Compose（沿用同一持久卷）
 
 覆盖层只增加挂点目录与环境变量，数据仍在命名卷 `firmware-data`：
@@ -280,7 +293,14 @@ FIRMWARE_TEST_PAUSE_DIR=/tmp/fw-pause \
 uvicorn app.main:app --port 8000 &
 
 bash scripts/race_repro.sh
+
+kill %1            # 复现结束，停止服务（数据保留在 /tmp/fw-data）
 ```
+
+脚本默认打 `http://localhost:8000`、标记目录取 `FIRMWARE_TEST_PAUSE_DIR`
+（未设置时为 `/tmp/fw-pause`），可用 `BASE_URL` / `FIRMWARE_TEST_PAUSE_DIR`
+环境变量覆盖；各等待环节有超时（默认 30 秒，`WAIT_MAX` 可调），超时或
+失败会释放挂点并以非零退出，脚本不会无限挂起。
 
 ### 手工等价 HTTP 调用（想逐步执行时）
 
@@ -292,22 +312,24 @@ B64=$(printf base | base64 | tr -d '\n')
 curl -s -X POST http://localhost:8000/devices -H 'Content-Type: application/json' \
   -d "{\"device_id\":\"dev-race\",\"initial_image_base64\":\"$B64\"}" >/dev/null
 
-# 1) 放置标记，发起声明 A（length=3）——它会提交后挂起
+# 1) 放置标记，发起声明 A（length=3）——它会提交后停在挂点上
 : > /tmp/fw-pause/declare_update
 curl -s -X PUT http://localhost:8000/devices/dev-race/update \
   -H 'Content-Type: application/json' \
   -d "{\"length\":3,\"sha256\":\"$SHA3\"}" > /tmp/respA.json &
 
-# 2) 轮询确认 A 已落库（应打印 3）
-sleep 0.2
-curl -s http://localhost:8000/devices/dev-race | grep -o '"declared_length":[0-9]*'
+# 2) 等 .held 出现：确认 A 已提交且停在返回前
+#    （不要用数据库可见代替——A 可能在 commit 后、进入挂点前被调度出去）
+while [ ! -e /tmp/fw-pause/declare_update.held ]; do sleep 0.05; done
+curl -s http://localhost:8000/devices/dev-race | grep -o '"declared_length":[0-9]*'  # 附带核对：3
 
 # 3) A 尚未返回时，完整执行声明 B（length=6）
 curl -s -X PUT http://localhost:8000/devices/dev-race/update \
   -H 'Content-Type: application/json' \
   -d "{\"length\":6,\"sha256\":\"$SHA6\"}" | grep -o '"declared_length":[0-9]*'   # 6
 
-# 4) 放行 A；修复前 /tmp/respA.json 里是 6（混入），修复后必须是 3
+# 4) 确认 A 仍未返回（jobs 里仍有它），再删除 .held 放行
+jobs
 rm -f /tmp/fw-pause/declare_update.held
 wait
 grep -o '"declared_length":[0-9]*' /tmp/respA.json    # 期望 3
@@ -325,6 +347,8 @@ python3 test_api.py
 - **受控交错（第 12 节）**：通过挂点确定性制造“后写在前写返回前落库”的交错，
   分别核对两次 `PUT /update`（长度 3、6）、`POST /devices`（创建响应保持初始
   状态）、`POST /confirm`（确认响应不带入随后声明）的**响应快照**与**最终
-  数据库状态**均等价于串行执行。
+  数据库状态**均等价于串行执行。三组回归都按“确认首请求已提交且停在返回前
+  （挂点事件，而非数据库可见）→ 发竞争请求 → 竞争响应完成且首响应仍未返回
+  → 放行”的顺序推进，覆盖首请求 commit 后被调度出去的情况。
 - **提交失败不报成功（第 13 节）**：注入连接代理让 `commit` 抛错，断言接口
   返回 5xx、库状态保持操作前、服务仍可继续处理请求。

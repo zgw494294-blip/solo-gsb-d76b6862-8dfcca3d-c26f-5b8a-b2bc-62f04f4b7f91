@@ -326,9 +326,19 @@ print("== 12. 受控交错：成功响应必须是本次操作完成时的快照
 # 挂点在“写事务已 commit、响应尚未返回”时触发。替换它后，第一个命中的
 # 请求会阻塞在 gate 上，测试趁此窗口让第二个请求完整提交，再放行第一个，
 # 从而确定性地构造出“后写在前写返回查询之前落库”的交错。
+#
+# 确定性顺序（与 scripts/race_repro.sh 一致）：
+#   1. 启动首请求线程；
+#   2. 等 parked 事件 —— 首请求已提交且确实停在返回前。不能用数据库可见
+#      代替这一确认：首请求可能在 commit 之后、进入挂点之前被调度出去，
+#      此时若就启动竞争线程，竞争请求会抢占“第一个”名额并挂起，而测试
+#      又在等它完成，形成等待环；
+#   3. 再启动竞争线程并等它完整返回；
+#   4. 确认首请求仍未返回，才 set(gate) 放行。
 @contextmanager
-def paused_first_commit():
-    gate = threading.Event()
+def paused_first_commit(pre_park_delay=0.0):
+    gate = threading.Event()    # 主线程放行信号
+    parked = threading.Event()  # 首个提交者已进入挂点（已提交且停在返回前）
     pick_lock = threading.Lock()
     state = {"first": True}
 
@@ -338,12 +348,17 @@ def paused_first_commit():
             mine = state["first"]
             state["first"] = False
         if mine:
+            if pre_park_delay:
+                # 模拟“commit 之后、进入挂点之前被调度出去”：parked 尚未
+                # 置位，测试必须停在 parked.wait 上而不是凭数据库可见放行
+                time.sleep(pre_park_delay)
+            parked.set()
             gate.wait(timeout=10)
 
     saved = m.after_commit_hook
     m.after_commit_hook = hook
     try:
-        yield gate
+        yield parked, gate
     finally:
         gate.set()          # 即使断言失败也放行，避免残留守护线程挂死
         m.after_commit_hook = saved
@@ -371,25 +386,27 @@ sha6 = hashlib.sha256(img6).hexdigest()
 client.post("/devices", json={"device_id": "race-update", "initial_image_base64": b64(b"init")})
 
 boxA, boxB = {}, {}
-with paused_first_commit() as gate:
+# pre_park_delay 模拟首请求 commit 后被调度出去：parked 迟迟不置位，
+# 测试必须靠 parked 事件确认挂起，而不是凭数据库可见放行竞争请求。
+with paused_first_commit(pre_park_delay=0.3) as (parked, gate):
     tA = start(lambda: TestClient(m.app).put(
         "/devices/race-update/update", json={"length": 3, "sha256": sha3}), box=boxA)
-    # 等 A 已提交但尚未返回（挂点阻塞），再让 B 完整跑完
-    for _ in range(200):
-        st = client.get("/devices/race-update").json()
-        if st["slots"]["slot1"]["declared_length"] == 3:
-            break
-        time.sleep(0.01)
-    check("A committed (length 3) before its response returns",
+    # 等 A 已提交且停在返回前（挂点确认），再让 B 完整跑完
+    check("A committed and parked before its response returns",
+          parked.wait(timeout=10))
+    check("A's write visible in DB (length 3)",
           client.get("/devices/race-update").json()["slots"]["slot1"]["declared_length"] == 3)
 
     tB = start(lambda: TestClient(m.app).put(
         "/devices/race-update/update", json={"length": 6, "sha256": sha6}), box=boxB)
     tB.join(timeout=10)
     check("B fully completes (length 6) while A still paused",
-          client.get("/devices/race-update").json()["slots"]["slot1"]["declared_length"] == 6)
+          not tB.is_alive()
+          and client.get("/devices/race-update").json()["slots"]["slot1"]["declared_length"] == 6)
+    check("A response still not returned before release", tA.is_alive())
     gate.set()
     tA.join(timeout=10)
+    check("A returns after release", not tA.is_alive())
 
 check("no thread raised", "exc" not in boxA and "exc" not in boxB, (boxA, boxB))
 ra, rb = boxA["v"], boxB["v"]
@@ -411,24 +428,25 @@ print("-- 12b. POST /devices：创建响应保持初始状态，不含随后的�
 img_c = b"fw-create"
 sha_c = hashlib.sha256(img_c).hexdigest()
 boxC, boxD = {}, {}
-with paused_first_commit() as gate:
+with paused_first_commit() as (parked, gate):
     tC = start(lambda: TestClient(m.app).post(
         "/devices", json={"device_id": "race-create",
                           "initial_image_base64": b64(img_c)}), box=boxC)
-    for _ in range(200):
-        if "race-create" in client.get("/devices").json()["devices"]:
-            break
-        time.sleep(0.01)
-    check("create committed but response not returned yet",
+    check("create committed and parked before its response returns",
+          parked.wait(timeout=10))
+    check("create visible in DB",
           "race-create" in client.get("/devices").json()["devices"])
 
     tD = start(lambda: TestClient(m.app).put(
         "/devices/race-create/update", json={"length": 99, "sha256": "44" * 32}), box=boxD)
     tD.join(timeout=10)
     check("later declaration landed (99) before create response returns",
-          client.get("/devices/race-create").json()["slots"]["slot1"]["declared_length"] == 99)
+          not tD.is_alive()
+          and client.get("/devices/race-create").json()["slots"]["slot1"]["declared_length"] == 99)
+    check("create response still not returned before release", tC.is_alive())
     gate.set()
     tC.join(timeout=10)
+    check("create returns after release", not tC.is_alive())
 
 check("no thread raised", "exc" not in boxC and "exc" not in boxD, (boxC, boxD))
 rc, rd = boxC["v"], boxD["v"]
@@ -462,14 +480,12 @@ check("race-confirm trial pending",
       and bool(tok))
 
 boxE, boxF = {}, {}
-with paused_first_commit() as gate:
+with paused_first_commit() as (parked, gate):
     tE = start(lambda: TestClient(m.app).post(
         "/devices/race-confirm/confirm", params={"token": tok}), box=boxE)
-    for _ in range(200):
-        if client.get("/devices/race-confirm").json()["trial_state"] == "running-confirmed":
-            break
-        time.sleep(0.01)
-    check("confirm committed but response not returned yet",
+    check("confirm committed and parked before its response returns",
+          parked.wait(timeout=10))
+    check("confirm visible in DB (running-confirmed)",
           client.get("/devices/race-confirm").json()["trial_state"] == "running-confirmed")
 
     # 确认已解锁写入：针对新的候选槽（旧确认槽 0）声明 7 字节
@@ -477,9 +493,12 @@ with paused_first_commit() as gate:
         "/devices/race-confirm/update", json={"length": 7, "sha256": "55" * 32}), box=boxF)
     tF.join(timeout=10)
     check("post-confirm declaration landed (7) on slot0 before confirm response returns",
-          client.get("/devices/race-confirm").json()["slots"]["slot0"]["declared_length"] == 7)
+          not tF.is_alive()
+          and client.get("/devices/race-confirm").json()["slots"]["slot0"]["declared_length"] == 7)
+    check("confirm response still not returned before release", tE.is_alive())
     gate.set()
     tE.join(timeout=10)
+    check("confirm returns after release", not tE.is_alive())
 
 check("no thread raised", "exc" not in boxE and "exc" not in boxF, (boxE, boxF))
 re_, rf = boxE["v"], boxF["v"]
